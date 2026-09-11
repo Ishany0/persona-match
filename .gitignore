@@ -1,0 +1,11 @@
+# backend
+__pycache__/
+*.pyc
+*.db
+venv/
+.env
+
+# frontend
+frontend/node_modules/
+frontend/build/
+npm-debug.log*
