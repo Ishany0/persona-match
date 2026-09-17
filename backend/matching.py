@@ -1,10 +1,4 @@
-# matching.py
-# Handles the compatibility scoring between two users for a given category.
-# Using plain Jaccard similarity over tag sets for now - good enough for an
-# MVP, we can swap this out for something smarter later if needed.
-
 def normalize_tags(tags):
-    """Lowercase + strip everything, drop empties, dedupe via set."""
     cleaned = []
     for t in tags:
         if t is None:
@@ -32,11 +26,6 @@ def jaccard_similarity(tags_a, tags_b):
 
 
 def rank_matches(my_tags, candidates):
-    """
-    candidates: list of dicts like {"user_id": .., "name": .., "tags": [...]}
-    returns the same list, with a "score" key added, sorted best first.
-    Zero-score matches are dropped since they add no value to the list.
-    """
     ranked = []
     for c in candidates:
         score = jaccard_similarity(my_tags, c["tags"])
