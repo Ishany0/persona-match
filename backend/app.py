@@ -1,16 +1,16 @@
-# app.py
 # PersonaMatch backend - Flask + SQLite
-#
-# This is the MVP backend for PersonaMatch. It handles:
-#   - registration / login (basic, no real session/JWT security yet)
+
+# It handles:
+#   - registration / login (basic, no real session/security yet)
 #   - profile creation
 #   - category questionnaires (Study Partner, Project Teammate, Roommate, Mentor)
 #   - matching engine (Jaccard similarity, see matching.py)
 #   - basic in-app messaging
 #
-# NOTE: auth here is intentionally simple for the prototype stage - we just
+# auth here is intentionally simple for the prototype stage 
+# we just
 # return the user's id after login and the frontend keeps it in localStorage.
-# Definitely needs real sessions/JWT before this goes anywhere near production.
+# Definitely needs real sessions/security before this goes anywhere near production.
 
 import os
 import sqlite3
@@ -92,9 +92,8 @@ def user_to_dict(row):
     }
 
 
-# ---------------------------------------------------------------------
+
 # auth
-# ---------------------------------------------------------------------
 
 @app.route("/api/register", methods=["POST"])
 def register():
@@ -107,7 +106,7 @@ def register():
         return jsonify({"error": "name, email and password are all required"}), 400
 
     # very basic "university email" check for the prototype - just needs an @
-    # and a dot after it. real version should check against a domain allowlist.
+    # and a dot after it. real version should check against thapar mail domain .
     if "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"error": "please use a valid email address"}), 400
 
@@ -146,9 +145,8 @@ def login():
     return jsonify(user_to_dict(row)), 200
 
 
-# ---------------------------------------------------------------------
+
 # profile
-# ---------------------------------------------------------------------
 
 @app.route("/api/profile/<int:user_id>", methods=["GET"])
 def get_profile(user_id):
@@ -186,9 +184,7 @@ def update_profile(user_id):
     return jsonify(user_to_dict(updated)), 200
 
 
-# ---------------------------------------------------------------------
 # category questionnaire + matching
-# ---------------------------------------------------------------------
 
 @app.route("/api/categories", methods=["GET"])
 def get_categories():
@@ -262,9 +258,7 @@ def get_matches(user_id, category):
     return jsonify(ranked), 200
 
 
-# ---------------------------------------------------------------------
 # messaging (basic - no websockets yet, frontend just polls)
-# ---------------------------------------------------------------------
 
 @app.route("/api/messages", methods=["POST"])
 def send_message():
