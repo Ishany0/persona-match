@@ -1,4 +1,4 @@
-# PersonaMatch backend - Flask + SQLite
+# PersonaMatch backend - Flask (for web server) + SQLite (for storage)
 
 # It handles:
 #   - registration / login (basic, no real session/security yet)
@@ -7,7 +7,7 @@
 #   - matching engine (Jaccard similarity, see matching.py)
 #   - basic in-app messaging
 #
-# auth here is intentionally simple for the prototype stage 
+# auth here is intentionally simple for the prototype stage  (no sessions, no per-request authorization checks)
 # we just
 # return the user's id after login and the frontend keeps it in localStorage.
 # Definitely needs real sessions/security before this goes anywhere near production.
@@ -18,7 +18,7 @@ import json
 from datetime import datetime
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS
+from flask_cors import CORS    #wide open so that the seperately running frontend ( diff port in dev) can call it w/o errors
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from matching import rank_matches
@@ -32,9 +32,12 @@ app = Flask(__name__)
 CORS(app)  # frontend runs on a different port during dev, so just allow all for now
 
 
+
+#databases - 3 tables
+# users , personas and messages
 def get_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row    #so rows can be accessed like dicts (row["name"])
     return conn
 
 
@@ -81,13 +84,13 @@ def init_db():
     conn.close()
 
 
-def user_to_dict(row):
+def user_to_dict(row):   #converts a DB row into a JSON-friendly dict
     return {
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
         "bio": row["bio"],
-        "interests": json.loads(row["interests"] or "[]"),
+        "interests": json.loads(row["interests"] or "[]"),     #JSON strings back into Python lists.
         "personality_tags": json.loads(row["personality_tags"] or "[]"),
     }
 
