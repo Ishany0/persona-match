@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, Link } from "react-router-dom";
 import { getConversation, sendMessage } from "../api";
 
 export default function Chat({ user }) {
@@ -15,15 +15,11 @@ export default function Chat({ user }) {
 
   useEffect(() => {
     refresh();
-    // simple polling so both sides see new messages without a full refresh
     const interval = setInterval(refresh, 3000);
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [otherId]);
+  }, [otherId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
 
   async function handleSend(e) {
     e.preventDefault();
@@ -34,31 +30,12 @@ export default function Chat({ user }) {
   }
 
   if (!user) return null;
+  const name = decodeURIComponent(otherName);
 
   return (
-    <div className="page chat-page">
-      <h2>Chat with {decodeURIComponent(otherName)}</h2>
-
-      <div className="chat-window">
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            className={"chat-bubble " + (String(m.sender_id) === String(user.id) ? "mine" : "theirs")}
-          >
-            {m.body}
-          </div>
-        ))}
-        <div ref={bottomRef} />
-      </div>
-
-      <form onSubmit={handleSend} className="chat-input-row">
-        <input
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          placeholder="Type a message..."
-        />
-        <button type="submit" className="btn primary">Send</button>
-      </form>
+    <div className="page chat-page-new">
+      <div className="chat-head"><div><Link to="/matches" className="back-link">← Back to matches</Link><h1>Chat with {name}</h1><p>Start with something simple. You already have a shared interest.</p></div><div className="chat-person"><span>{name.charAt(0).toUpperCase()}</span><div><strong>{name}</strong><small>PersonaMatch connection</small></div></div></div>
+      <div className="chat-panel"><div className="chat-messages">{messages.length === 0 && <div className="chat-empty">Say hi 👋</div>}{messages.map((m, i) => <div key={i} className={`chat-bubble ${String(m.sender_id) === String(user.id) ? "mine" : "theirs"}`}>{m.body}</div>)}<div ref={bottomRef} /></div><form onSubmit={handleSend} className="chat-compose"><input value={body} onChange={(e) => setBody(e.target.value)} placeholder={`Message ${name}...`} /><button className="send-btn" type="submit">→</button></form></div>
     </div>
   );
 }
