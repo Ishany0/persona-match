@@ -15,7 +15,11 @@
 import os
 import sqlite3
 import json
-from datetime import datetime
+import hashlib
+import secrets
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS    #wide open so that the seperately running frontend ( diff port in dev) can call it w/o errors
@@ -27,6 +31,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "personamatch.db")
 
 CATEGORIES = ["Study Partner", "Project Teammate", "Roommate", "Mentor"]
+
+# --- email verification config (all overridable through environment variables) ---
+# APP_BASE_URL is the address the verification link points to (this backend, or the frontend
+# if it forwards the token to /api/verify/<token>).
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:5000")
+VERIFICATION_TOKEN_HOURS = 24
+STATUS_UNVERIFIED = "Unverified"
+STATUS_VERIFIED = "Verified"
+# if SMTP_HOST is not set, emails are not sent: the link is printed in the server console (dev mode)
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@solace.local")
 
 app = Flask(__name__)
 CORS(app)  # frontend runs on a different port during dev, so just allow all for now
@@ -83,6 +101,70 @@ def init_db():
     conn.commit()
     conn.close()
 
+    ensure_user_verification_columns()   # upgrades an already existing personamatch.db too
+
+
+def ensure_user_verification_columns():
+    """Adds the email-verification columns to the users table if they are missing.
+    Done with ALTER TABLE (instead of editing CREATE TABLE) so an existing database keeps its data.
+    Accounts that already existed before this change are treated as Verified so they can still log in."""
+    conn = get_db()
+    existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "status" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'Verified'")
+    if "verification_token_hash" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN verification_token_hash TEXT")
+    if "verification_expires_at" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN verification_expires_at TEXT")
+    conn.commit()
+    conn.close()
+
+
+def hash_token(token):
+    # only the hash of the token is stored, so a DB leak does not expose usable verification links
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_verification_token(conn, user_id):
+    """Creates a fresh one-time token for the user, stores its hash + expiry, returns the raw token."""
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.utcnow() + timedelta(hours=VERIFICATION_TOKEN_HOURS)).isoformat()
+    conn.execute(
+        "UPDATE users SET verification_token_hash = ?, verification_expires_at = ? WHERE id = ?",
+        (hash_token(token), expires, user_id),
+    )
+    conn.commit()
+    return token
+
+
+def send_verification_email(to_email, token):
+    link = f"{APP_BASE_URL}/api/verify/{token}"
+    if not SMTP_HOST:
+        # dev mode: no mail server configured, print the link so the flow can still be tested
+        print(f"[DEV] verification link for {to_email}: {link}")
+        return True
+
+    msg = EmailMessage()
+    msg["Subject"] = "Verify your Solace account"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(
+        "Welcome to Solace!\n\n"
+        "Please verify your email by clicking the link below:\n"
+        f"{link}\n\n"
+        f"This link expires in {VERIFICATION_TOKEN_HOURS} hours."
+    )
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"[ERROR] could not send verification email to {to_email}: {e}")
+        return False
+
 
 def user_to_dict(row):   #converts a DB row into a JSON-friendly dict
     return {
@@ -92,6 +174,7 @@ def user_to_dict(row):   #converts a DB row into a JSON-friendly dict
         "bio": row["bio"],
         "interests": json.loads(row["interests"] or "[]"),     #JSON strings back into Python lists.
         "personality_tags": json.loads(row["personality_tags"] or "[]"),
+        "status": row["status"],     #Verified / Unverified (email verification)
     }
 
 
@@ -105,8 +188,13 @@ def register():
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
 
+    # name is optional now (registration page only asks for email + password);
+    # if it is missing we just use the part of the email before the @
+    if not name and email:
+        name = email.split("@")[0]
+
     if not name or not email or not password:
-        return jsonify({"error": "name, email and password are all required"}), 400
+        return jsonify({"error": "email and password are required"}), 400
 
     # very basic "university email" check for the prototype - just needs an @
     # and a dot after it. real version should check against thapar mail domain .
@@ -117,19 +205,82 @@ def register():
     existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
     if existing:
         conn.close()
-        return jsonify({"error": "an account with this email already exists"}), 409
+        return jsonify({"error": "Email already registered"}), 409
 
     pw_hash = generate_password_hash(password)
-    cur = conn.execute(
-        "INSERT INTO users (name, email, password_hash) VALUES (?, ?, ?)",
-        (name, email, pw_hash),
-    )
-    conn.commit()
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (name, email, password_hash, status) VALUES (?, ?, ?, ?)",
+            (name, email, pw_hash, STATUS_UNVERIFIED),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # two requests with the same email at the same time - the UNIQUE constraint keeps it to one record
+        conn.close()
+        return jsonify({"error": "Email already registered"}), 409
+
     user_id = cur.lastrowid
+    token = issue_verification_token(conn, user_id)
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
 
-    return jsonify(user_to_dict(row)), 201
+    email_sent = send_verification_email(email, token)
+    result = user_to_dict(row)
+    if email_sent:
+        result["message"] = f"Registration successful. A verification email has been sent to {email}"
+    else:
+        result["message"] = ("Account created, but the verification email could not be sent. "
+                             "Please request a new one via /api/resend-verification")
+    return jsonify(result), 201
+
+
+@app.route("/api/verify/<string:token>", methods=["GET"])
+def verify_email(token):
+    token_hash = hash_token(token)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, verification_expires_at FROM users WHERE verification_token_hash = ?",
+        (token_hash,),
+    ).fetchone()
+
+    expired = False
+    if row is not None and row["verification_expires_at"]:
+        expired = datetime.utcnow() > datetime.fromisoformat(row["verification_expires_at"])
+
+    if row is None or expired:
+        conn.close()
+        msg, code = "Verification link is invalid or has expired", 400
+    else:
+        # mark verified and burn the token so the link cannot be reused
+        conn.execute(
+            "UPDATE users SET status = ?, verification_token_hash = NULL, verification_expires_at = NULL WHERE id = ?",
+            (STATUS_VERIFIED, row["id"]),
+        )
+        conn.commit()
+        conn.close()
+        msg, code = "Email verified successfully, please log in", 200
+
+    # a browser (user clicking the link in the mail) gets a small page, API/frontend callers get JSON
+    best = request.accept_mimetypes.best_match(["application/json", "text/html"])
+    if best == "text/html" and request.accept_mimetypes[best] > request.accept_mimetypes["application/json"]:
+        return f"<html><body style='font-family:sans-serif;text-align:center;margin-top:15vh'><h2>{msg}</h2></body></html>", code
+    return jsonify({"message": msg} if code == 200 else {"error": msg}), code
+
+
+@app.route("/api/resend-verification", methods=["POST"])
+def resend_verification():
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+
+    conn = get_db()
+    row = conn.execute("SELECT id, status FROM users WHERE email = ?", (email,)).fetchone()
+    if row is not None and row["status"] != STATUS_VERIFIED:
+        token = issue_verification_token(conn, row["id"])
+        send_verification_email(email, token)
+    conn.close()
+
+    # same answer whether or not the email exists, so this can't be used to find out who is registered
+    return jsonify({"message": "If the account exists and is unverified, a new verification email has been sent"}), 200
 
 
 @app.route("/api/login", methods=["POST"])
@@ -143,7 +294,11 @@ def login():
     conn.close()
 
     if row is None or not check_password_hash(row["password_hash"], password):
-        return jsonify({"error": "invalid email or password"}), 401
+        return jsonify({"error": "Invalid credentials"}), 401
+
+    # right password but the email was never verified -> not allowed in yet
+    if row["status"] != STATUS_VERIFIED:
+        return jsonify({"error": "Please verify your email before logging in"}), 403
 
     return jsonify(user_to_dict(row)), 200
 
