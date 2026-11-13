@@ -1,16 +1,7 @@
-# PersonaMatch backend - Flask (for web server) + SQLite (for storage)
-
-# It handles:
-#   - registration / login (basic, no real session/security yet)
-#   - profile creation
-#   - category questionnaires (Study Partner, Project Teammate, Roommate, Mentor)
-#   - matching engine (Jaccard similarity, see matching.py)
-#   - basic in-app messaging
-#
-# auth here is intentionally simple for the prototype stage  (no sessions, no per-request authorization checks)
-# we just
-# return the user's id after login and the frontend keeps it in localStorage.
-# Definitely needs real sessions/security before this goes anywhere near production.
+# PersonaMatch backend — Flask REST API + SQLite.
+# Includes verified university registration, password recovery, signed bearer
+# sessions, profiles, category questionnaires, Jaccard matching and messaging.
+# This is an academic demo build; review README.md before public deployment.
 
 import os
 import sqlite3
@@ -20,14 +11,18 @@ import secrets
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta
+from functools import wraps
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from dotenv import load_dotenv
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS    #wide open so that the seperately running frontend ( diff port in dev) can call it w/o errors
+from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from matching import rank_matches
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 DB_PATH = os.path.join(BASE_DIR, "personamatch.db")
 
 CATEGORIES = ["Study Partner", "Project Teammate", "Roommate", "Mentor"]
@@ -37,6 +32,10 @@ CATEGORIES = ["Study Partner", "Project Teammate", "Roommate", "Mentor"]
 # if it forwards the token to /api/verify/<token>).
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:5000")
 VERIFICATION_TOKEN_HOURS = 24
+RESET_TOKEN_MINUTES = 30
+ALLOWED_EMAIL_DOMAIN = os.environ.get("ALLOWED_EMAIL_DOMAIN", "thapar.edu").lower().strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "development-only-change-this-secret")
+serializer = URLSafeTimedSerializer(SECRET_KEY, salt="personamatch-session")
 STATUS_UNVERIFIED = "Unverified"
 STATUS_VERIFIED = "Verified"
 # if SMTP_HOST is not set, emails are not sent: the link is printed in the server console (dev mode)
@@ -44,10 +43,11 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@solace.local")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER or "no-reply@personamatch.local")
 
 app = Flask(__name__)
-CORS(app)  # frontend runs on a different port during dev, so just allow all for now
+allowed_origins = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000").split(",")
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
 
 
@@ -116,8 +116,35 @@ def ensure_user_verification_columns():
         conn.execute("ALTER TABLE users ADD COLUMN verification_token_hash TEXT")
     if "verification_expires_at" not in existing_cols:
         conn.execute("ALTER TABLE users ADD COLUMN verification_expires_at TEXT")
+    if "reset_token_hash" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN reset_token_hash TEXT")
+    if "reset_expires_at" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN reset_expires_at TEXT")
     conn.commit()
     conn.close()
+
+
+def issue_access_token(user_id):
+    return serializer.dumps({"user_id": int(user_id), "purpose": "access"})
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return jsonify({"error": "Please log in to continue"}), 401
+        try:
+            payload = serializer.loads(header[7:], max_age=12 * 60 * 60)
+            if payload.get("purpose") != "access":
+                raise BadSignature("invalid token purpose")
+            request.user_id = int(payload["user_id"])
+        except (BadSignature, SignatureExpired, KeyError, TypeError, ValueError):
+            return jsonify({"error": "Your session has expired. Please log in again."}), 401
+        if "user_id" in kwargs and int(kwargs["user_id"]) != request.user_id:
+            return jsonify({"error": "You cannot access another user's account"}), 403
+        return fn(*args, **kwargs)
+    return wrapped
 
 
 def hash_token(token):
@@ -145,11 +172,11 @@ def send_verification_email(to_email, token):
         return True
 
     msg = EmailMessage()
-    msg["Subject"] = "Verify your Solace account"
+    msg["Subject"] = "Verify your PersonaMatch account"
     msg["From"] = SMTP_FROM
     msg["To"] = to_email
     msg.set_content(
-        "Welcome to Solace!\n\n"
+        "Welcome to PersonaMatch!\n\n"
         "Please verify your email by clicking the link below:\n"
         f"{link}\n\n"
         f"This link expires in {VERIFICATION_TOKEN_HOURS} hours."
@@ -196,10 +223,10 @@ def register():
     if not name or not email or not password:
         return jsonify({"error": "email and password are required"}), 400
 
-    # very basic "university email" check for the prototype - just needs an @
-    # and a dot after it. real version should check against thapar mail domain .
-    if "@" not in email or "." not in email.split("@")[-1]:
-        return jsonify({"error": "please use a valid email address"}), 400
+    if not email.endswith("@" + ALLOWED_EMAIL_DOMAIN):
+        return jsonify({"error": f"Please use your university email ending in @{ALLOWED_EMAIL_DOMAIN}"}), 400
+    if len(password) < 8 or not any(ch.isalpha() for ch in password) or not any(ch.isdigit() for ch in password):
+        return jsonify({"error": "Password must be at least 8 characters and contain letters and numbers"}), 400
 
     conn = get_db()
     existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
@@ -226,7 +253,9 @@ def register():
 
     email_sent = send_verification_email(email, token)
     result = user_to_dict(row)
-    if email_sent:
+    if not SMTP_HOST:
+        result["message"] = "Registration successful. DEV MODE: open the verification link printed in the backend terminal."
+    elif email_sent:
         result["message"] = f"Registration successful. A verification email has been sent to {email}"
     else:
         result["message"] = ("Account created, but the verification email could not be sent. "
@@ -283,6 +312,68 @@ def resend_verification():
     return jsonify({"message": "If the account exists and is unverified, a new verification email has been sent"}), 200
 
 
+def send_password_reset_email(to_email, token):
+    link = f"{APP_BASE_URL}/api/reset-password/{token}"
+    if not SMTP_HOST:
+        print(f"[DEV] password reset link for {to_email}: {link}")
+        return True
+    msg = EmailMessage()
+    msg["Subject"] = "Reset your PersonaMatch password"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.set_content(f"Reset your PersonaMatch password using this one-time link (valid for {RESET_TOKEN_MINUTES} minutes):\n{link}\n\nIf you did not request this, ignore this email.")
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        app.logger.exception("Could not send password reset email: %s", exc)
+        return False
+
+
+@app.route("/api/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    conn = get_db()
+    row = conn.execute("SELECT id, status FROM users WHERE email = ?", (email,)).fetchone()
+    if row and row["status"] == STATUS_VERIFIED:
+        token = secrets.token_urlsafe(32)
+        expires = (datetime.utcnow() + timedelta(minutes=RESET_TOKEN_MINUTES)).isoformat()
+        conn.execute("UPDATE users SET reset_token_hash = ?, reset_expires_at = ? WHERE id = ?", (hash_token(token), expires, row["id"]))
+        conn.commit()
+        send_password_reset_email(email, token)
+    conn.close()
+    message = "If a verified account exists for that email, a password reset link has been sent."
+    if not SMTP_HOST:
+        message += " In local development, check the backend terminal for the reset link."
+    return jsonify({"message": message}), 200
+
+
+@app.route("/api/reset-password/<string:token>", methods=["GET", "POST"])
+def reset_password(token):
+    if request.method == "GET":
+        return """<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Reset PersonaMatch password</title><style>body{font:16px Arial;background:#f6f3fb;display:grid;place-items:center;min-height:100vh}main{background:white;padding:32px;border-radius:18px;max-width:420px;width:85%}input,button{box-sizing:border-box;width:100%;padding:12px;margin:10px 0;border:1px solid #ddd;border-radius:9px}button{background:#6c55a3;color:white;border:0}</style></head><body><main><h2>Choose a new password</h2><form method='post'><label>New password</label><input name='password' type='password' minlength='8' required><label>Confirm password</label><input name='confirm' type='password' minlength='8' required><button>Update password</button></form></main></body></html>"""
+    data = request.get_json(silent=True) or request.form
+    password, confirm = data.get("password", ""), data.get("confirm", "")
+    if len(password) < 8 or not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
+        return ("Password must be at least 8 characters and contain letters and numbers", 400)
+    if password != confirm:
+        return ("Passwords do not match", 400)
+    conn = get_db()
+    row = conn.execute("SELECT id, reset_expires_at FROM users WHERE reset_token_hash = ?", (hash_token(token),)).fetchone()
+    if not row or not row["reset_expires_at"] or datetime.utcnow() > datetime.fromisoformat(row["reset_expires_at"]):
+        conn.close()
+        return ("This password reset link is invalid or has expired. Request a new one.", 400)
+    conn.execute("UPDATE users SET password_hash = ?, reset_token_hash = NULL, reset_expires_at = NULL WHERE id = ?", (generate_password_hash(password), row["id"]))
+    conn.commit()
+    conn.close()
+    return "<h2>Password updated successfully. You can now log in to PersonaMatch.</h2>"
+
+
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json(force=True)
@@ -300,13 +391,16 @@ def login():
     if row["status"] != STATUS_VERIFIED:
         return jsonify({"error": "Please verify your email before logging in"}), 403
 
-    return jsonify(user_to_dict(row)), 200
+    result = user_to_dict(row)
+    result["access_token"] = issue_access_token(row["id"])
+    return jsonify(result), 200
 
 
 
 # profile
 
 @app.route("/api/profile/<int:user_id>", methods=["GET"])
+@require_auth
 def get_profile(user_id):
     conn = get_db()
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -319,6 +413,7 @@ def get_profile(user_id):
 
 
 @app.route("/api/profile/<int:user_id>", methods=["PUT"])
+@require_auth
 def update_profile(user_id):
     data = request.get_json(force=True)
     bio = data.get("bio", "")
@@ -350,6 +445,7 @@ def get_categories():
 
 
 @app.route("/api/questionnaire", methods=["POST"])
+@require_auth
 def submit_questionnaire():
     data = request.get_json(force=True)
     user_id = data.get("user_id")
@@ -358,6 +454,8 @@ def submit_questionnaire():
 
     if not user_id or category not in CATEGORIES:
         return jsonify({"error": "user_id and a valid category are required"}), 400
+    if int(user_id) != request.user_id:
+        return jsonify({"error": "You cannot update another user's questionnaire"}), 403
 
     conn = get_db()
     conn.execute(
@@ -375,6 +473,7 @@ def submit_questionnaire():
 
 
 @app.route("/api/matches/<int:user_id>/<string:category>", methods=["GET"])
+@require_auth
 def get_matches(user_id, category):
     if category not in CATEGORIES:
         return jsonify({"error": "unknown category"}), 400
@@ -419,6 +518,7 @@ def get_matches(user_id, category):
 # messaging (basic - no websockets yet, frontend just polls)
 
 @app.route("/api/messages", methods=["POST"])
+@require_auth
 def send_message():
     data = request.get_json(force=True)
     sender_id = data.get("sender_id")
@@ -427,6 +527,10 @@ def send_message():
 
     if not sender_id or not receiver_id or not body:
         return jsonify({"error": "sender_id, receiver_id and body are required"}), 400
+    if int(sender_id) != request.user_id:
+        return jsonify({"error": "You can only send messages as yourself"}), 403
+    if len(body) > 4000:
+        return jsonify({"error": "Message is too long (maximum 4000 characters)"}), 400
 
     conn = get_db()
     conn.execute(
@@ -440,6 +544,7 @@ def send_message():
 
 
 @app.route("/api/messages/<int:user_id>/<int:other_id>", methods=["GET"])
+@require_auth
 def get_conversation(user_id, other_id):
     conn = get_db()
     rows = conn.execute(
